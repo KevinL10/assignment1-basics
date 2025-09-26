@@ -77,7 +77,7 @@ def test_train_bpe_special_tokens(snapshot):
     # Check that the special token is not in the vocab
     vocabs_without_specials = [word for word in vocab.values() if word != b"<|endoftext|>"]
     for word_bytes in vocabs_without_specials:
-        assert b"<|" not in word_bytes
+        assert b"<|" not in word_bytes, word_bytes
 
     snapshot.assert_match(
         {
