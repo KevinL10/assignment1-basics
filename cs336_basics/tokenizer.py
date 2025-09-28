@@ -1,8 +1,9 @@
 from dataclasses import dataclass, field
-from heapq import merge
+from heapq import heappop, heappush, merge
 from io import BytesIO
 import functools
 import multiprocessing
+import heapq
 import os
 import regex as re
 from collections import defaultdict, Counter
@@ -24,6 +25,16 @@ newest newest newest newest newest newest
 class PretokenInfo:
     freq: int
     pretoken: list[int]
+
+
+@dataclass
+class PairHeapElem:
+    freq: int
+    pair_bytes: tuple[bytes, bytes]
+    pair: tuple[int, int]
+
+    def __lt__(self, other):
+        return (self.freq, self.pair_bytes, self.pair) > (other.freq, other.pair_bytes, other.pair)
 
 
 def find_chunk_boundaries(
@@ -134,6 +145,8 @@ def _update_freq_and_occ(
     pretoken_info: dict[int, PretokenInfo],
     pair_freq: Counter[tuple[int, int]],
     pair_occ: dict[tuple[int, int], list[int]],
+    pair_heap: list[PairHeapElem],
+    vocab: dict[int, bytes],
     token1: int,
     token2: int,
     new_token: int,
@@ -162,19 +175,29 @@ def _update_freq_and_occ(
                     pair = (merged_pretoken[-1], pretoken[i])
                     pair_freq[pair] -= freq
                     pair_occ[pair].remove(pretoken_id)
+                    heappush(pair_heap, PairHeapElem(pair_freq[pair], (vocab[pair[0]], vocab[pair[1]]), pair))
 
                     new_pair = (merged_pretoken[-1], new_token)
                     pair_freq[new_pair] += freq
                     pair_occ[new_pair].append(pretoken_id)
+                    heappush(
+                        pair_heap,
+                        PairHeapElem(pair_freq[new_pair], (vocab[new_pair[0]], vocab[new_pair[1]]), new_pair),
+                    )
 
                 if i + 2 < len(pretoken):
                     pair = (pretoken[i + 1], pretoken[i + 2])
                     pair_freq[pair] -= freq
                     pair_occ[pair].remove(pretoken_id)
+                    heappush(pair_heap, PairHeapElem(pair_freq[pair], (vocab[pair[0]], vocab[pair[1]]), pair))
 
                     new_pair = (new_token, pretoken[i + 2])
                     pair_freq[new_pair] += freq
                     pair_occ[new_pair].append(pretoken_id)
+                    heappush(
+                        pair_heap,
+                        PairHeapElem(pair_freq[new_pair], (vocab[new_pair[0]], vocab[new_pair[1]]), new_pair),
+                    )
 
                 merged_pretoken.append(new_token)
                 i += 2
@@ -219,14 +242,20 @@ def _train_bpe(
     start = time.perf_counter()
     pair_freq, pair_occ = _get_pair_stats(pretoken_info)
 
-    for _ in tqdm.tqdm(range(vocab_size - len(vocab))):
-        # Take most common pair and break ties by choosing lexicographically greater pair
-        token1, token2 = max(pair_freq, key=lambda pair: (pair_freq[pair], vocab[pair[0]], vocab[pair[1]]))
+    pair_heap = [PairHeapElem(freq, (vocab[pair[0]], vocab[pair[1]]), pair) for pair, freq in pair_freq.items()]
+    heapq.heapify(pair_heap)
 
+    for _ in tqdm.tqdm(range(vocab_size - len(vocab))):
+        # Ignore stale frequencies
+        while pair_freq[pair_heap[0].pair] != pair_heap[0].freq:
+            heappop(pair_heap)
+
+        head = heappop(pair_heap)
+        token1, token2 = head.pair
         vocab[next_idx] = vocab[token1] + vocab[token2]
         merges.append((vocab[token1], vocab[token2]))
 
-        _update_freq_and_occ(pretoken_info, pair_freq, pair_occ, token1, token2, next_idx)
+        _update_freq_and_occ(pretoken_info, pair_freq, pair_occ, pair_heap, vocab, token1, token2, next_idx)
         next_idx += 1
 
     assert len(vocab) == vocab_size
