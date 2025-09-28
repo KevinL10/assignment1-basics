@@ -1,8 +1,15 @@
+from dataclasses import dataclass, field
+from heapq import merge
+from io import BytesIO
+import functools
+import multiprocessing
 import os
 import regex as re
-from collections import defaultdict
+from collections import defaultdict, Counter
+from typing import BinaryIO
+import time
+import tqdm
 
-from sympy.matrices.matrixbase import _jordan_form
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
@@ -13,8 +20,182 @@ newest newest newest newest newest newest
 """
 
 
-def train_bpe(
-    text: str, vocab_size: int, special_tokens: list[str]
+@dataclass
+class PretokenInfo:
+    freq: int
+    pretoken: list[int]
+
+
+def find_chunk_boundaries(
+    file: BinaryIO,
+    desired_num_chunks: int,
+    split_special_token: bytes,
+) -> list[int]:
+    """
+    Chunk the file into parts that can be counted independently.
+    May return fewer chunks if the boundaries end up overlapping.
+    """
+    assert isinstance(split_special_token, bytes), "Must represent special token as a bytestring"
+
+    # Get total file size in bytes
+    file.seek(0, os.SEEK_END)
+    file_size = file.tell()
+    file.seek(0)
+
+    chunk_size = file_size // desired_num_chunks
+
+    # Initial guesses for chunk boundary locations, uniformly spaced
+    # Chunks start on previous index, don't include last index
+    chunk_boundaries = [i * chunk_size for i in range(desired_num_chunks + 1)]
+    chunk_boundaries[-1] = file_size
+
+    mini_chunk_size = 4096  # Read ahead by 4k bytes at a time
+
+    for bi in range(1, len(chunk_boundaries) - 1):
+        initial_position = chunk_boundaries[bi]
+        file.seek(initial_position)  # Start at boundary guess
+        while True:
+            mini_chunk = file.read(mini_chunk_size)  # Read a mini chunk
+
+            # If EOF, this boundary should be at the end of the file
+            if mini_chunk == b"":
+                chunk_boundaries[bi] = file_size
+                break
+
+            # Find the special token in the mini chunk
+            found_at = mini_chunk.find(split_special_token)
+            if found_at != -1:
+                chunk_boundaries[bi] = initial_position + found_at
+                break
+            initial_position += mini_chunk_size
+
+    # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
+    return sorted(set(chunk_boundaries))
+
+
+def _pretokenize_chunk(
+    bounds: tuple[int, int], input_path: str | os.PathLike, special_tokens: list[str]
+) -> Counter[tuple[bytes, ...]]:
+    """Pretokenizes a chunk of text and returns a mapping of pretoken counts"""
+
+    start, end = bounds
+    with open(input_path, "rb") as file:
+        file.seek(start)
+        chunk = file.read(end - start).decode("utf-8", errors="ignore")
+
+    sections = re.split("|".join(map(re.escape, special_tokens)), chunk)
+    pretoken_counts = Counter()
+
+    for section in sections:
+        for pretoken in re.finditer(PAT, section):
+            pretoken_counts[tuple(pretoken.group().encode())] += 1
+
+    return pretoken_counts
+
+
+def _pretokenize_file(
+    input_path: str | os.PathLike, num_processes: int, split_token: str, special_tokens: list[str]
+) -> Counter[tuple[bytes, ...]]:
+    """Pretokenizes the file and returns a mapping of pretokens counts"""
+
+    with open(input_path, "rb") as file:
+        boundaries = find_chunk_boundaries(file, num_processes, split_token)
+
+    chunks = [(start, end) for start, end in zip(boundaries[:-1], boundaries[1:])]
+    with multiprocessing.Pool(num_processes) as pool:
+        # Note: move file reading to each worker to avoid blocking main thread
+        all_pretoken_counts = pool.imap_unordered(
+            functools.partial(_pretokenize_chunk, input_path=input_path, special_tokens=special_tokens), chunks
+        )
+        return sum(all_pretoken_counts, Counter())
+
+
+def _get_pair_stats(
+    pretoken_info: dict[int, PretokenInfo],
+) -> tuple[Counter[tuple[int, int]], dict[tuple[int, int], list[int]]]:
+    """Returns the count of each pair and a list of pretoken IDs that the pair was found in."""
+
+    pair_freq = Counter()
+    pair_occ = defaultdict(list)
+
+    for pretoken_id, pretoken_info in pretoken_info.items():
+        pretoken = pretoken_info.pretoken
+        freq = pretoken_info.freq
+
+        for token1, token2 in zip(pretoken, pretoken[1:]):
+            pair = (token1, token2)
+            pair_freq[pair] += freq
+            pair_occ[pair].append(pretoken_id)
+
+    return pair_freq, pair_occ
+
+
+def _update_freq_and_occ(
+    pretoken_info: dict[int, PretokenInfo],
+    pair_freq: Counter[tuple[int, int]],
+    pair_occ: dict[tuple[int, int], list[int]],
+    token1: int,
+    token2: int,
+    new_token: int,
+):
+    """Updates the pretoken mapping and pair stats for a new merge"""
+
+    for pretoken_id in pair_occ[(token1, token2)]:
+        freq = pretoken_info[pretoken_id].freq
+        pretoken = pretoken_info[pretoken_id].pretoken
+        merged_pretoken = []
+
+        i = 0
+        while i < len(pretoken):
+            if pretoken[i : i + 2] == [token1, token2]:
+                # Decrement counts for old token pairs that will no longer exist once we merge the tokens.
+                # In particular, if we have (x, a, b, y) and we'd like to merge (a, b) -> c, then:
+                # - decrement (x, a) and (b, y)
+                # - increment (x, c) and (c, y)
+                if i > 0:
+                    # We use merged_pretoken[-1] to handle the case where we have consecutive pairs that need
+                    # to be merged. For example, for (x, a, b, a, b, y):
+                    # first pass: - dec (x, a), (b, a); inc (x, c), (c, a). `merged_pretoken` so far = [x, c]
+                    # second pass: dec (c, a), (b, y); inc (c, c), (c, y)
+                    # end result: dec (x, a), (b, a), (b, y); inc (x, c), (c, c), (c, y)
+                    # This avoids double subtracting the occurence for (b, a) in the middle.
+                    pair = (merged_pretoken[-1], pretoken[i])
+                    pair_freq[pair] -= freq
+                    pair_occ[pair].remove(pretoken_id)
+
+                    new_pair = (merged_pretoken[-1], new_token)
+                    pair_freq[new_pair] += freq
+                    pair_occ[new_pair].append(pretoken_id)
+
+                if i + 2 < len(pretoken):
+                    pair = (pretoken[i + 1], pretoken[i + 2])
+                    pair_freq[pair] -= freq
+                    pair_occ[pair].remove(pretoken_id)
+
+                    new_pair = (new_token, pretoken[i + 2])
+                    pair_freq[new_pair] += freq
+                    pair_occ[new_pair].append(pretoken_id)
+
+                merged_pretoken.append(new_token)
+                i += 2
+            else:
+                merged_pretoken.append(pretoken[i])
+                i += 1
+
+        # Update the actual pretoken in the mapping
+        pretoken_info[pretoken_id].pretoken = merged_pretoken
+
+    # Get rid of the old token pair since we've already merged them
+    del pair_freq[(token1, token2)]
+    del pair_occ[(token1, token2)]
+
+
+def _train_bpe(
+    input_path: str | os.PathLike,
+    vocab_size: int,
+    special_tokens: list[str],
+    num_processes: int = 32,
+    split_token=b"<|endoftext|>",
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
     # Mapping from token ID to bytes. Initialized with bytes and special tokens.
     vocab: dict[int, bytes] = {i: bytes([i]) for i in range(256)}
@@ -26,57 +207,34 @@ def train_bpe(
     # A list of BPE merges ordered by creation.
     merges: list[tuple[bytes, bytes]] = []
 
-    # First, split by the special tokens. No merging should happen
-    # across special tokens.
-    sections = re.split("|".join(map(re.escape, special_tokens)), text)
+    print(f"pretokenizing {input_path}")
+    start = time.perf_counter()
+    pretoken_counter = _pretokenize_file(input_path, num_processes, split_token, special_tokens)
+    print("pretokenization took", time.perf_counter() - start)
 
-    pretoken_counts = defaultdict(int)
-    for section in sections:
-        for pretoken in re.finditer(PAT, section):
-            pretoken_counts[tuple(pretoken.group().encode())] += 1
+    pretoken_info = {}
+    for i, pretoken in enumerate(pretoken_counter):
+        pretoken_info[i] = PretokenInfo(pretoken_counter[pretoken], list(pretoken))
 
-    while len(vocab) < vocab_size:
-        pair_counts: dict[tuple[int, int], int] = defaultdict(int)
+    start = time.perf_counter()
+    pair_freq, pair_occ = _get_pair_stats(pretoken_info)
 
-        for pretoken, count in pretoken_counts.items():
-            for token1, token2 in zip(pretoken, pretoken[1:]):
-                pair_counts[(token1, token2)] += count
-
+    for _ in tqdm.tqdm(range(vocab_size - len(vocab))):
         # Take most common pair and break ties by choosing lexicographically greater pair
-        token1, token2 = max(pair_counts, key=lambda k: (pair_counts[k], vocab[k[0]], vocab[k[1]]))
+        token1, token2 = max(pair_freq, key=lambda pair: (pair_freq[pair], vocab[pair[0]], vocab[pair[1]]))
 
         vocab[next_idx] = vocab[token1] + vocab[token2]
         merges.append((vocab[token1], vocab[token2]))
 
-        # Merge the existing pretokens
-        new_pretoken_counts = defaultdict(int)
-        for pretoken, count in pretoken_counts.items():
-            new_pretoken = []
-            i = 0
-            while i < len(pretoken):
-                if pretoken[i : i + 2] == (token1, token2):
-                    new_pretoken.append(next_idx)
-                    i += 2
-                else:
-                    new_pretoken.append(pretoken[i])
-                    i += 1
-
-            new_pretoken_counts[tuple(new_pretoken)] += count
-
-        pretoken_counts = new_pretoken_counts
+        _update_freq_and_occ(pretoken_info, pair_freq, pair_occ, token1, token2, next_idx)
         next_idx += 1
 
+    assert len(vocab) == vocab_size
+    print("training duration", time.perf_counter() - start)
     return vocab, merges
 
 
 def run_train_bpe_adapter(
     input_path: str | os.PathLike, vocab_size: int, special_tokens: list[str]
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-    with open(input_path) as f:
-        text = f.read()
-    return train_bpe(text, vocab_size, special_tokens)
-
-
-if __name__ == "__main__":
-    vocab, merges = train_bpe(TEXT, 260, ["<ctrl99>", "<|endoftext|>"])
-    print("merges:", merges)
+    return _train_bpe(input_path, vocab_size, special_tokens)
