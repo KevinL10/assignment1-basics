@@ -1,13 +1,14 @@
 from dataclasses import dataclass, field
-from heapq import heappop, heappush, merge
+from heapq import heappop, heappush
 from io import BytesIO
 import functools
+import json
 import multiprocessing
 import heapq
 import os
 import regex as re
 from collections import defaultdict, Counter
-from typing import BinaryIO
+from typing import BinaryIO, Iterable, Iterator
 import time
 import tqdm
 
@@ -144,6 +145,7 @@ def _get_pair_stats(
 def _update_freq_and_occ(
     pretoken_info: dict[int, PretokenInfo],
     pair_freq: Counter[tuple[int, int]],
+    # TODO: we should keep track of occurences as a set of pretokens to avoid recomputation.
     pair_occ: dict[tuple[int, int], list[int]],
     pair_heap: list[PairHeapElem],
     vocab: dict[int, bytes],
@@ -267,3 +269,91 @@ def run_train_bpe_adapter(
     input_path: str | os.PathLike, vocab_size: int, special_tokens: list[str]
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
     return _train_bpe(input_path, vocab_size, special_tokens)
+
+
+class Tokenizer:
+    def __init__(
+        self, vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]], special_tokens: list[str] | None = None
+    ):
+        self.vocab = vocab
+        self.merges = merges
+        # Sort special tokens by descending length so that a special token that is a substring of another special token
+        # is matched after the parent string.
+        self.special_tokens = sorted(special_tokens, key=len, reverse=True) if special_tokens else None
+        self.inv_vocab = {v: k for k, v in self.vocab.items()}
+
+    @classmethod
+    def from_files(cls, vocab_filepath: str, merges_filepath: str, special_tokens: list[str] | None = None):
+        with open(vocab_filepath) as f:
+            vocab = json.load(f)
+
+        with open(merges_filepath, "rb") as f:
+            merges = [tuple(line.split(b" ", 1)) for line in f.readlines()]
+
+        return cls(vocab, merges, special_tokens)
+
+    def _encode_pretoken(self, pretoken: str) -> list[int]:
+        tokens: list[int] = [self.inv_vocab[bytes([token])] for token in pretoken.encode()]
+
+        for merge in self.merges:
+            new_tokens = []
+            i = 0
+            while i < len(tokens):
+                if tokens[i : i + 2] == [self.inv_vocab[merge[0]], self.inv_vocab[merge[1]]]:
+                    new_tokens.append(self.inv_vocab[merge[0] + merge[1]])
+                    i += 2
+                else:
+                    new_tokens.append(tokens[i])
+                    i += 1
+
+            tokens = new_tokens
+
+        return tokens
+
+    def encode(self, text: str) -> list[int]:
+        if self.special_tokens:
+            sections = re.split("(" + "|".join(map(re.escape, self.special_tokens)) + ")", text)
+        else:
+            sections = [text]
+
+        tokens = []
+
+        for section in sections:
+            if self.special_tokens and section in self.special_tokens:
+                tokens.append(self.inv_vocab[section.encode()])
+            else:
+                for pretoken in re.finditer(PAT, section):
+                    tokens.extend(self._encode_pretoken(pretoken.group()))
+
+        return tokens
+
+    def decode(self, tokens: list[int]) -> str:
+        return b"".join([self.vocab[token] for token in tokens]).decode("utf-8", errors="replace")
+
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+        for item in iterable:
+            yield from self.encode(item)
+
+
+if __name__ == "__main__":
+    t = Tokenizer(
+        {
+            0: b" ",
+            1: b"a",
+            2: b"c",
+            3: b"e",
+            4: b"h",
+            5: b"t",
+            6: b"th",
+            7: b" c",
+            8: b" a",
+            9: b"the",
+            10: b" at",
+            11: b"<ctrl99>",
+            12: b"<ctrl99><ctrl99>",
+        },
+        [(b"t", b"h"), (b" ", b"c"), (b" ", b"a"), (b"th", b"e"), (b" a", b"t")],
+        ["<ctrl99>", "<ctrl99><ctrl99>"],
+    )
+
+    print(t.encode("the cat <ctrl99><ctrl99>ate "))
