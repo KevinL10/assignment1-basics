@@ -1,29 +1,41 @@
 import json
-from cs336_basics.tokenizer import run_train_bpe_adapter
+import os
+from cs336_basics.tokenizer import Tokenizer, train_bpe
+import numpy as np
+import numpy.typing as npt
 
 
-def train_bpe_tinystories():
-    vocab, merges = run_train_bpe_adapter("data/TinyStoriesV2-GPT4-valid.txt", 10_000, ["<|endoftext|>"])
-    with open("data/tinystories_vocab.txt", "w") as f:
-        for token in vocab.values():
-            f.write(f"{token.decode('utf-8', errors='ignore')}\n")
+def train_and_save(
+    dataset: str | os.PathLike,
+    vocab_out: str | os.PathLike,
+    merges_out: str | os.PathLike,
+    vocab_size=10_000,
+    special_tokens=["<|endoftext|>"],
+) -> Tokenizer:
+    vocab, merges = train_bpe(dataset, vocab_size, special_tokens)
+    with open(vocab_out, "w") as f:
+        json.dump({k: v.decode("utf-8", "ignore") for k, v in vocab.items()}, f)
 
-    with open("data/tinystories_merges.txt", "w") as f:
+    with open(merges_out, "w") as f:
         for merge in merges:
-            f.write(f"{merge[0]} {merge[1]}\n")
+            f.write(f"{merge[0].decode("utf-8", "ignore")} {merge[1].decode("utf-8", "ignore")}\n")
+
+    return Tokenizer(vocab, merges, special_tokens)
 
 
-def train_bpe_owt():
-    vocab, merges = run_train_bpe_adapter("data/owt_train.txt", 32_000, ["<|endoftext|>"])
-    with open("data/owt_vocab.txt", "w") as f:
-        for token in vocab.values():
-            f.write(f"{token.decode('utf-8', errors='ignore')}\n")
+def encode_and_save(tokenizer: Tokenizer, dataset_path: str | os.PathLike, out: str | os.PathLike):
+    with open(dataset_path) as f:
+        dataset = f.read()
 
-    with open("data/owt_merges.txt", "w") as f:
-        for merge in merges:
-            f.write(f"{merge[0]} {merge[1]}\n")
+    encoded = tokenizer.encode(dataset)
+    print(f"Encoded {dataset_path} with {len(encoded)} tokens")
+
+    # print(dataset == tokenizer.decode(encoded))
+    np.save(out, np.array(encoded, dtype=np.uint16))
 
 
 if __name__ == "__main__":
-    # train_bpe_tinystories()
-    train_bpe_owt()
+    dataset = "data/TinyStoriesV2-GPT4-valid.txt"
+    tokenizer = train_and_save(dataset, "data/tinystories_vocab.json", "data/tinystories_merges.txt")
+
+    encode_and_save(tokenizer, dataset, "data/tinystories_encoded.npy")

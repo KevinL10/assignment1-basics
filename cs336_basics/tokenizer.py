@@ -215,7 +215,7 @@ def _update_freq_and_occ(
     del pair_occ[(token1, token2)]
 
 
-def _train_bpe(
+def train_bpe(
     input_path: str | os.PathLike,
     vocab_size: int,
     special_tokens: list[str],
@@ -265,12 +265,6 @@ def _train_bpe(
     return vocab, merges
 
 
-def run_train_bpe_adapter(
-    input_path: str | os.PathLike, vocab_size: int, special_tokens: list[str]
-) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-    return _train_bpe(input_path, vocab_size, special_tokens)
-
-
 class Tokenizer:
     def __init__(
         self, vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]], special_tokens: list[str] | None = None
@@ -281,6 +275,12 @@ class Tokenizer:
         # is matched after the parent string.
         self.special_tokens = sorted(special_tokens, key=len, reverse=True) if special_tokens else None
         self.inv_vocab = {v: k for k, v in self.vocab.items()}
+
+        self.rank = {
+            (self.inv_vocab[token1], self.inv_vocab[token2]): rank for rank, (token1, token2) in enumerate(self.merges)
+        }
+
+        self.pat = re.compile(PAT)
 
     @classmethod
     def from_files(cls, vocab_filepath: str, merges_filepath: str, special_tokens: list[str] | None = None):
@@ -295,12 +295,25 @@ class Tokenizer:
     def _encode_pretoken(self, pretoken: str) -> list[int]:
         tokens: list[int] = [self.inv_vocab[bytes([token])] for token in pretoken.encode()]
 
-        for merge in self.merges:
+        while True:
+            min_rank = float("inf")
+            min_pair = None
+
+            for token1, token2 in zip(tokens, tokens[1:]):
+                r = self.rank.get((token1, token2))
+                if r is not None and r < min_rank:
+                    min_rank = r
+                    min_pair = [token1, token2]
+
+            if min_pair is None:
+                break
+
+            merged_token = self.inv_vocab[self.vocab[min_pair[0]] + self.vocab[min_pair[1]]]
             new_tokens = []
             i = 0
             while i < len(tokens):
-                if tokens[i : i + 2] == [self.inv_vocab[merge[0]], self.inv_vocab[merge[1]]]:
-                    new_tokens.append(self.inv_vocab[merge[0] + merge[1]])
+                if tokens[i : i + 2] == min_pair:
+                    new_tokens.append(merged_token)
                     i += 2
                 else:
                     new_tokens.append(tokens[i])
@@ -317,13 +330,13 @@ class Tokenizer:
             sections = [text]
 
         tokens = []
-
-        for section in sections:
+        for section in tqdm.tqdm(sections):
             if self.special_tokens and section in self.special_tokens:
                 tokens.append(self.inv_vocab[section.encode()])
-            else:
-                for pretoken in re.finditer(PAT, section):
-                    tokens.extend(self._encode_pretoken(pretoken.group()))
+                continue
+
+            for pretoken in re.finditer(self.pat, section):
+                tokens.extend(self._encode_pretoken(pretoken.group()))
 
         return tokens
 

@@ -199,7 +199,6 @@ class Transformer(nn.Module):
         context_length: int,
         num_layers: int,
         theta: float | None = None,
-        max_seq_len: int | None = None,
     ):
         super().__init__()
         self.layers = nn.ModuleList(
