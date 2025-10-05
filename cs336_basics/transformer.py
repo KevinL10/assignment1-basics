@@ -216,3 +216,45 @@ class Transformer(nn.Module):
         x = self.ln_final(x)
         x = self.lm_head(x)
         return x
+
+    def _generate_token(self, x: torch.Tensor, temperature: float = 1.0, top_p: float | None = 0.9) -> torch.Tensor:
+        # unbatched-generation: x has shape (L, )
+        logits: torch.Tensor = self(x)[-1]  # (V, )
+
+        if temperature == 0.0:
+            return logits.argmax(dim=-1, keepdim=True)
+
+        probs = softmax(logits / temperature, dim=-1)
+
+        if top_p:
+            probs, sorted_indices = probs.sort(dim=-1, descending=True)
+            mask = probs.cumsum(dim=-1) <= top_p
+            if not mask.any():
+                mask[0] = True
+
+            probs *= mask
+            probs /= probs.sum(dim=-1, keepdim=True)
+
+            next_id = torch.multinomial(probs, 1)
+            return sorted_indices[next_id]
+
+        return torch.multinomial(probs, 1)
+
+    @torch.inference_mode()
+    def generate(
+        self,
+        tokens: list[int],
+        temperature: float = 1.0,
+        top_p: float | None = 0.9,
+        max_tokens: int = 100,
+        eos_id: int | None = None,
+    ) -> list[int]:
+        x = torch.tensor(tokens, dtype=torch.int64)
+        for _ in range(max_tokens):
+            new_token = self._generate_token(x, temperature, top_p)
+            x = torch.cat([x, new_token], dim=-1)
+
+            if eos_id is not None and new_token.item() == eos_id:
+                break
+
+        return x.tolist()

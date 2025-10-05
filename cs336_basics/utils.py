@@ -1,5 +1,6 @@
-import os
 from typing import IO, BinaryIO, Iterable
+import os
+from cs336_basics.transformer import softmax
 import torch
 import math
 import numpy.typing as npt
@@ -86,3 +87,23 @@ def load_checkpoint(
     optimizer.load_state_dict(obj["optimizer"])
 
     return obj["iteration"]
+
+
+def generate(
+    model: torch.nn.Module,
+    input: torch.Tensor,
+    temperature: float = 1.0,
+    top_p: float | None = 0.9,
+):
+    logits = model(input)[...:-1:,]  # (B, V)
+    probs = softmax(logits / temperature, dim=-1)
+
+    if top_p:
+        probs, _ = probs.sort(dim=-1, descending=True)
+        # TODO: handle case where most likely token is >= top_p
+        mask = probs.cumsum(dim=-1) <= top_p
+        probs *= mask
+        probs /= probs.sum(dim=-1, keepdim=True)
+
+    vocab = torch.multinomial(probs, 1)
+    return vocab.shape

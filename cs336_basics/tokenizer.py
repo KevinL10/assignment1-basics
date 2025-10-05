@@ -11,6 +11,7 @@ from collections import defaultdict, Counter
 from typing import BinaryIO, Iterable, Iterator
 import time
 import tqdm
+import base64
 
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
@@ -286,13 +287,28 @@ class Tokenizer:
     def from_files(cls, vocab_filepath: str, merges_filepath: str, special_tokens: list[str] | None = None):
         with open(vocab_filepath) as f:
             vocab = json.load(f)
+            vocab = {token_id: base64.b64decode(token) for token, token_id in vocab.items()}
 
-        with open(merges_filepath, "rb") as f:
-            merges = [tuple(line.split(b" ", 1)) for line in f.readlines()]
+        with open(merges_filepath) as f:
+            merges = []
+            for line in f.readlines():
+                x, y = line.split(" ", 1)
+                merges.append((base64.b64decode(x), base64.b64decode(y)))
 
         return cls(vocab, merges, special_tokens)
 
+    def save(self, vocab_out: str | os.PathLike, merges_out):
+        with open(vocab_out, "w") as f:
+            json.dump({base64.b64encode(token).decode(): token_id for token_id, token in self.vocab.items()}, f)
+
+        with open(merges_out, "w") as f:
+            for merge in self.merges:
+                f.write(f"{base64.b64encode(merge[0]).decode()} {base64.b64encode(merge[0]).decode()}\n")
+
     def _encode_pretoken(self, pretoken: str) -> list[int]:
+        if len(pretoken) == 0:
+            return []
+
         tokens: list[int] = [self.inv_vocab[bytes([token])] for token in pretoken.encode()]
 
         while True:
