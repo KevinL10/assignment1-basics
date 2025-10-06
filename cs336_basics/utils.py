@@ -12,7 +12,7 @@ def cross_entropy(inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     # subtract max of elements for numerical stability
     logits = inputs - torch.amax(inputs, dim=-1, keepdim=True)
     log_probs = logits - torch.log(torch.sum(torch.exp(logits), dim=-1, keepdim=True))
-    nll = -log_probs.gather(-1, targets.unsqueeze(-1))
+    nll = -log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
     return nll.mean()
 
 
@@ -23,13 +23,12 @@ def lr_cosine_schedule(
 
     if it < warmup_iters:
         return it / warmup_iters * max_learning_rate
-
-    if warmup_iters <= it <= cosine_cycle_iters:
+    elif it < cosine_cycle_iters:
         return min_learning_rate + 1 / 2 * (
             1 + math.cos((it - warmup_iters) / (cosine_cycle_iters - warmup_iters) * math.pi)
         ) * (max_learning_rate - min_learning_rate)
-
-    return min_learning_rate
+    else:
+        return min_learning_rate
 
 
 def clip_gradients(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float, eps: float = 1e-6):
@@ -51,11 +50,11 @@ def clip_gradients(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float,
 
 
 def get_batch(
-    dataset: npt.NDArray, batch_size: int, context_length: int, device: str
+    dataset: np.ndarray, batch_size: int, context_length: int, device: str
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Returns a random batch from the provided dataset."""
 
-    indices = np.random.choice(len(dataset) - context_length, size=batch_size, replace=False)
+    indices = np.random.randint(len(dataset) - context_length, size=batch_size)
     x = torch.tensor(
         np.array([dataset[idx : idx + context_length] for idx in indices]), device=device, dtype=torch.int64
     )

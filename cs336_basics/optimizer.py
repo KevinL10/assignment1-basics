@@ -66,6 +66,8 @@ class AdamW(torch.optim.Optimizer):
                 p.data -= lr_t * m / (v**0.5 + group["eps"])
                 p.data -= group["lr"] * group["weight_decay"] * p.data
 
+                group["current_lr"] = lr_t
+
                 state["t"] = t + 1
                 state["m"] = m_new
                 state["v"] = v_new

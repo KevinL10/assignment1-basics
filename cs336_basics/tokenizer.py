@@ -156,7 +156,7 @@ def _update_freq_and_occ(
 ):
     """Updates the pretoken mapping and pair stats for a new merge"""
 
-    for pretoken_id in pair_occ[(token1, token2)]:
+    for pretoken_id in set(pair_occ[(token1, token2)]):
         freq = pretoken_info[pretoken_id].freq
         pretoken = pretoken_info[pretoken_id].pretoken
         merged_pretoken = []
@@ -255,6 +255,10 @@ def train_bpe(
 
         head = heappop(pair_heap)
         token1, token2 = head.pair
+        if vocab[token1] == b"E" and vocab[token2] == b"E":
+            print("FOUND")
+            print(next_idx)
+            continue
         vocab[next_idx] = vocab[token1] + vocab[token2]
         merges.append((vocab[token1], vocab[token2]))
 
@@ -274,6 +278,7 @@ class Tokenizer:
         self.merges = merges
         # Sort special tokens by descending length so that a special token that is a substring of another special token
         # is matched after the parent string.
+        assert special_tokens is None or isinstance(special_tokens, list)
         self.special_tokens = sorted(special_tokens, key=len, reverse=True) if special_tokens else None
         self.inv_vocab = {v: k for k, v in self.vocab.items()}
 
@@ -303,7 +308,7 @@ class Tokenizer:
 
         with open(merges_out, "w") as f:
             for merge in self.merges:
-                f.write(f"{base64.b64encode(merge[0]).decode()} {base64.b64encode(merge[0]).decode()}\n")
+                f.write(f"{base64.b64encode(merge[0]).decode()} {base64.b64encode(merge[1]).decode()}\n")
 
     def _encode_pretoken(self, pretoken: str) -> list[int]:
         if len(pretoken) == 0:

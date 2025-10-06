@@ -147,7 +147,7 @@ class MultiHeadSelfAttention(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (..., seq_len, d_model)
         seq_len = x.shape[-2]
-        mask = torch.tril(torch.ones((seq_len, seq_len))) == 1
+        mask = torch.tril(torch.ones((seq_len, seq_len), device=x.device)) == 1
 
         # qkv: (..., seq_len, 3 * num_heads * d_k)
         q, k, v = rearrange(
@@ -207,6 +207,7 @@ class Transformer(nn.Module):
         self.token_embeddings = Embedding(vocab_size, d_model)
         self.ln_final = RMSNorm(d_model)
         self.lm_head = Linear(d_model, vocab_size)
+        self.context_length = context_length
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.token_embeddings(x)
@@ -246,14 +247,16 @@ class Transformer(nn.Module):
         tokens: list[int],
         temperature: float = 1.0,
         top_p: float | None = 0.9,
-        max_tokens: int = 100,
+        max_tokens: int = 256,
         eos_id: int | None = None,
+        device: str | None = None,
     ) -> list[int]:
-        x = torch.tensor(tokens, dtype=torch.int64)
+        x = torch.tensor(tokens, dtype=torch.int64, device=device)
         for _ in range(max_tokens):
-            new_token = self._generate_token(x, temperature, top_p)
+            new_token = self._generate_token(x[-self.context_length :], temperature, top_p)
             x = torch.cat([x, new_token], dim=-1)
 
+            print(new_token.item(), eos_id)
             if eos_id is not None and new_token.item() == eos_id:
                 break
 
